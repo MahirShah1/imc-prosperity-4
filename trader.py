@@ -6,9 +6,10 @@ import math
 
 class Trader:
     POSITION_LIMIT = {
-        "EMERALDS": 20,
-        "TOMATOES": 20,
+        "ASH_COATED_OSMIUM": 20,
+        "INTARIAN_PEPPER_ROOT": 20,
     }
+    MEMORY_LENGTH = 100
 
     # ---------- persistence helpers ----------
 
@@ -26,8 +27,8 @@ class Trader:
 
         return {
             "mid_hist": {
-                "EMERALDS": [],
-                "TOMATOES": [],
+                "ASH_COATED_OSMIUM": [],
+                "INTARIAN_PEPPER_ROOT": [],
             },
             "prev_mid": {},
         }
@@ -51,7 +52,7 @@ class Trader:
 
         if order_depth.sell_orders:
             best_ask = min(order_depth.sell_orders.keys())
-            best_ask_vol = order_depth.sell_orders[best_ask]  # usually negative in Prosperity
+            best_ask_vol = order_depth.sell_orders[best_ask]
 
         return best_bid, best_bid_vol, best_ask, best_ask_vol
 
@@ -94,11 +95,10 @@ class Trader:
 
     # ---------- fair values ----------
 
-    def fair_emeralds(self, position: int) -> float:
-        # Very stable product: hard anchor near 10000, inventory skew applied.
-        return 10000 - 0.25 * position
+    def fair_ash(self, mid: float, position: int) -> float:
+        return 10000 + 0.20 * (mid - 10000) - 0.18 * position
 
-    def fair_tomatoes(
+    def fair_pepper(
         self,
         mid: float,
         micro: Optional[float],
@@ -116,19 +116,13 @@ class Trader:
         if prev_mid is None:
             prev_mid = mid
 
-        # Dynamic fair:
-        # - mean reversion toward EMA
-        # - order book pressure via microprice
-        # - short-term reversion on the most recent move
         fair = (
             mid
-            - 0.20 * (mid - ema20)
-            + 0.80 * (micro - mid)
-            - 0.25 * (mid - prev_mid)
+            + 0.40 * (mid - ema20)
+            + 0.55 * (micro - mid)
+            + 0.10 * (mid - prev_mid)
         )
-
-        # inventory skew
-        fair -= 0.20 * position
+        fair -= 0.22 * position
         return fair
 
     # ---------- execution helpers ----------
@@ -146,9 +140,8 @@ class Trader:
         orders: List[Order] = []
         pos = position
 
-        # Buy asks that are too cheap
         for ask in sorted(order_depth.sell_orders.keys()):
-            ask_vol = -order_depth.sell_orders[ask]  # convert to positive available size
+            ask_vol = -order_depth.sell_orders[ask]
             if ask <= fair - take_threshold and pos < limit:
                 qty = min(ask_vol, limit - pos, max_clip)
                 if qty > 0:
@@ -157,7 +150,6 @@ class Trader:
             else:
                 break
 
-        # Sell bids that are too rich
         for bid in sorted(order_depth.buy_orders.keys(), reverse=True):
             bid_vol = order_depth.buy_orders[bid]
             if bid >= fair + take_threshold and pos > -limit:
@@ -181,15 +173,12 @@ class Trader:
         base_size: int,
     ) -> List[Order]:
         orders: List[Order] = []
-
         if best_bid is None or best_ask is None:
             return orders
 
-        # Try to quote one tick inside the spread while preserving positive edge.
         bid_quote = min(best_bid + 1, math.floor(fair - 1))
         ask_quote = max(best_ask - 1, math.ceil(fair + 1))
 
-        # If they cross, fall back to symmetric quotes around fair.
         if bid_quote >= ask_quote:
             bid_quote = math.floor(fair - 1)
             ask_quote = math.ceil(fair + 1)
@@ -203,7 +192,6 @@ class Trader:
         buy_size = min(base_size, buy_capacity)
         sell_size = min(base_size, sell_capacity)
 
-        # inventory-aware size reduction
         if position > 0.6 * limit:
             buy_size = min(buy_size, 1)
         if position < -0.6 * limit:
@@ -218,7 +206,7 @@ class Trader:
 
     # ---------- per-product strategies ----------
 
-    def trade_emeralds(
+    def trade_ash(
         self,
         product: str,
         order_depth: OrderDepth,
@@ -228,16 +216,19 @@ class Trader:
         limit = self.POSITION_LIMIT[product]
 
         best_bid, best_bid_vol, best_ask, best_ask_vol = self.best_bid_ask(order_depth)
-        fair = self.fair_emeralds(position)
+        mid = self.mid_price(best_bid, best_ask)
+        if mid is None:
+            return []
 
+        fair = self.fair_ash(mid, position)
         take_orders, new_pos = self.market_take(
             product=product,
             order_depth=order_depth,
             fair=fair,
             position=position,
             limit=limit,
-            take_threshold=2,
-            max_clip=6,
+            take_threshold=1.5,
+            max_clip=5,
         )
         orders.extend(take_orders)
 
@@ -248,13 +239,12 @@ class Trader:
             fair=fair,
             position=new_pos,
             limit=limit,
-            base_size=6,
+            base_size=4,
         )
         orders.extend(mm_orders)
-
         return orders
 
-    def trade_tomatoes(
+    def trade_pepper(
         self,
         product: str,
         order_depth: OrderDepth,
@@ -271,7 +261,7 @@ class Trader:
             return [], None
 
         micro = self.microprice(best_bid, best_bid_vol, best_ask, best_ask_vol)
-        fair = self.fair_tomatoes(mid, micro, prev_mid, mid_hist, position)
+        fair = self.fair_pepper(mid, micro, prev_mid, mid_hist, position)
 
         take_orders, new_pos = self.market_take(
             product=product,
@@ -279,7 +269,7 @@ class Trader:
             fair=fair,
             position=position,
             limit=limit,
-            take_threshold=2,
+            take_threshold=2.5,
             max_clip=5,
         )
         orders.extend(take_orders)
@@ -294,7 +284,6 @@ class Trader:
             base_size=5,
         )
         orders.extend(mm_orders)
-
         return orders, mid
 
     # ---------- main entry point ----------
@@ -302,7 +291,6 @@ class Trader:
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
         conversions = 0
-
         memory = self.load_memory(state.traderData)
 
         for product, order_depth in state.order_depths.items():
@@ -311,21 +299,12 @@ class Trader:
 
             position = state.position.get(product, 0)
 
-            if product == "EMERALDS":
-                result[product] = self.trade_emeralds(product, order_depth, position)
-
-                best_bid, _, best_ask, _ = self.best_bid_ask(order_depth)
-                mid = self.mid_price(best_bid, best_ask)
-                if mid is not None:
-                    memory["mid_hist"].setdefault(product, []).append(mid)
-                    memory["mid_hist"][product] = memory["mid_hist"][product][-100:]
-                    memory["prev_mid"][product] = mid
-
-            elif product == "TOMATOES":
+            if product == "ASH_COATED_OSMIUM":
+                result[product] = self.trade_ash(product, order_depth, position)
+            elif product == "INTARIAN_PEPPER_ROOT":
                 hist = memory["mid_hist"].setdefault(product, [])
                 prev_mid = memory["prev_mid"].get(product)
-
-                orders, new_mid = self.trade_tomatoes(
+                orders, new_mid = self.trade_pepper(
                     product,
                     order_depth,
                     position,
@@ -333,11 +312,18 @@ class Trader:
                     prev_mid,
                 )
                 result[product] = orders
-
                 if new_mid is not None:
                     hist.append(new_mid)
-                    memory["mid_hist"][product] = hist[-100:]
+                    memory["mid_hist"][product] = hist[-self.MEMORY_LENGTH:]
                     memory["prev_mid"][product] = new_mid
+                continue
+
+            best_bid, _, best_ask, _ = self.best_bid_ask(order_depth)
+            mid = self.mid_price(best_bid, best_ask)
+            if mid is not None:
+                memory["mid_hist"].setdefault(product, []).append(mid)
+                memory["mid_hist"][product] = memory["mid_hist"][product][-self.MEMORY_LENGTH:]
+                memory["prev_mid"][product] = mid
 
         trader_data = self.save_memory(memory)
         return result, conversions, trader_data

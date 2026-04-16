@@ -1,18 +1,27 @@
+import json
+from typing import Dict, List
+from Observation import Observation
+from OrderDepth import OrderDepth
+from Trade import Trade
+
 Time = int
 Symbol = str
 Product = str
 Position = int
+Listing = str
 
 class TradingState(object):
-   def __init__(self,
-                 traderData: str,
-                 timestamp: Time,
-                 listings: Dict[Symbol, Listing],
-                 order_depths: Dict[Symbol, OrderDepth],
-                 own_trades: Dict[Symbol, List[Trade]],
-                 market_trades: Dict[Symbol, List[Trade]],
-                 position: Dict[Product, Position],
-                 observations: Observation):
+    def __init__(
+        self,
+        traderData: str,
+        timestamp: Time,
+        listings: Dict[Symbol, Listing],
+        order_depths: Dict[Symbol, OrderDepth],
+        own_trades: Dict[Symbol, List[Trade]],
+        market_trades: Dict[Symbol, List[Trade]],
+        position: Dict[Product, Position],
+        observations: Observation,
+    ):
         self.traderData = traderData
         self.timestamp = timestamp
         self.listings = listings

@@ -6,324 +6,286 @@ import math
 
 class Trader:
     POSITION_LIMIT = {
-        "ASH_COATED_OSMIUM": 20,
-        "INTARIAN_PEPPER_ROOT": 20,
+        "ASH_COATED_OSMIUM": 80,
+        "INTARIAN_PEPPER_ROOT": 80,
     }
-    MEMORY_LENGTH = 100
+    MEMORY_LENGTH = 200
 
-    # ---------- persistence helpers ----------
+    # ── helpers ───────────────────────────────────────────────────────────────
 
-    def load_memory(self, trader_data: str):
+    def load_memory(self, trader_data: str) -> dict:
         if trader_data:
             try:
-                memory = json.loads(trader_data)
-                if "mid_hist" not in memory:
-                    memory["mid_hist"] = {}
-                if "prev_mid" not in memory:
-                    memory["prev_mid"] = {}
-                return memory
+                m = json.loads(trader_data)
+                m.setdefault("mid_hist", {})
+                return m
             except Exception:
                 pass
+        return {"mid_hist": {p: [] for p in self.POSITION_LIMIT}}
 
-        return {
-            "mid_hist": {
-                "ASH_COATED_OSMIUM": [],
-                "INTARIAN_PEPPER_ROOT": [],
-            },
-            "prev_mid": {},
-        }
-
-    def save_memory(self, memory) -> str:
+    def save_memory(self, memory: dict) -> str:
         return json.dumps(memory)
 
-    # ---------- market helpers ----------
+    def best_bid_ask(self, od: OrderDepth):
+        bb = bv = ba = av = None
+        if od.buy_orders:
+            bb = max(od.buy_orders)
+            bv = od.buy_orders[bb]
+        if od.sell_orders:
+            ba = min(od.sell_orders)
+            av = od.sell_orders[ba]
+        return bb, bv or 0, ba, av or 0
 
-    def best_bid_ask(
-        self, order_depth: OrderDepth
-    ) -> Tuple[Optional[int], int, Optional[int], int]:
-        best_bid = None
-        best_bid_vol = 0
-        best_ask = None
-        best_ask_vol = 0
-
-        if order_depth.buy_orders:
-            best_bid = max(order_depth.buy_orders.keys())
-            best_bid_vol = order_depth.buy_orders[best_bid]
-
-        if order_depth.sell_orders:
-            best_ask = min(order_depth.sell_orders.keys())
-            best_ask_vol = order_depth.sell_orders[best_ask]
-
-        return best_bid, best_bid_vol, best_ask, best_ask_vol
-
-    def mid_price(self, best_bid: Optional[int], best_ask: Optional[int]) -> Optional[float]:
-        if best_bid is not None and best_ask is not None:
-            return (best_bid + best_ask) / 2
-        if best_bid is not None:
-            return float(best_bid)
-        if best_ask is not None:
-            return float(best_ask)
+    def mid_price(self, bb, ba) -> Optional[float]:
+        if bb is not None and ba is not None:
+            return (bb + ba) / 2.0
+        if bb is not None:
+            return float(bb)
+        if ba is not None:
+            return float(ba)
         return None
 
-    def microprice(
-        self,
-        best_bid: Optional[int],
-        best_bid_vol: int,
-        best_ask: Optional[int],
-        best_ask_vol: int,
-    ) -> Optional[float]:
-        if best_bid is None or best_ask is None:
+    def ema(self, vals: list, span: int) -> Optional[float]:
+        if not vals:
             return None
-
-        bid_size = max(best_bid_vol, 0)
-        ask_size = abs(min(best_ask_vol, 0))
-
-        denom = bid_size + ask_size
-        if denom == 0:
-            return (best_bid + best_ask) / 2
-
-        return (best_ask * bid_size + best_bid * ask_size) / denom
-
-    def ema(self, values: List[float], span: int = 20) -> Optional[float]:
-        if not values:
-            return None
-        alpha = 2 / (span + 1)
-        e = values[0]
-        for x in values[1:]:
-            e = alpha * x + (1 - alpha) * e
+        a = 2.0 / (span + 1)
+        e = vals[0]
+        for v in vals[1:]:
+            e = a * v + (1 - a) * e
         return e
 
-    # ---------- fair values ----------
+    def stddev(self, vals: list) -> float:
+        if len(vals) < 2:
+            return 0.0
+        mean = sum(vals) / len(vals)
+        return math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
 
-    def fair_ash(self, mid: float, position: int) -> float:
-        return 10000 + 0.20 * (mid - 10000) - 0.18 * position
+    # ── PEPPER: strong uptrend, always stay max long ──────────────────────────
+    #
+    # Data pattern:
+    #   - price rises ~+1000 per day (slope ≈ 0.001/timestamp within 0..999900)
+    #   - jumps +1000 overnight between days
+    #   - holding +20 from day -2 to end of day 0 captures ~60,000 PnL
+    #
+    # Strategy:
+    #   1. Accumulate to +20 as quickly as possible
+    #   2. Hold; only sell passively into large spikes above fair
+    #   3. Fair value = momentum-adjusted mid, with hard long bias
 
-    def fair_pepper(
-        self,
-        mid: float,
-        micro: Optional[float],
-        prev_mid: Optional[float],
-        hist: List[float],
-        position: int,
-    ) -> float:
-        ema20 = self.ema(hist[-20:], span=20) if hist else mid
-        if ema20 is None:
-            ema20 = mid
-
-        if micro is None:
-            micro = mid
-
-        if prev_mid is None:
-            prev_mid = mid
-
-        fair = (
-            mid
-            + 0.40 * (mid - ema20)
-            + 0.55 * (micro - mid)
-            + 0.10 * (mid - prev_mid)
-        )
-        fair -= 0.22 * position
-        return fair
-
-    # ---------- execution helpers ----------
-
-    def market_take(
+    def trade_pepper(
         self,
         product: str,
-        order_depth: OrderDepth,
-        fair: float,
+        od: OrderDepth,
         position: int,
-        limit: int,
-        take_threshold: float,
-        max_clip: int,
-    ) -> Tuple[List[Order], int]:
+        hist: list,
+    ) -> Tuple[List[Order], Optional[float]]:
+        limit = self.POSITION_LIMIT[product]
         orders: List[Order] = []
-        pos = position
 
-        for ask in sorted(order_depth.sell_orders.keys()):
-            ask_vol = -order_depth.sell_orders[ask]
-            if ask <= fair - take_threshold and pos < limit:
-                qty = min(ask_vol, limit - pos, max_clip)
+        bb, bv, ba, av = self.best_bid_ask(od)
+        mid = self.mid_price(bb, ba)
+        if mid is None:
+            return [], None
+
+        # EMA-based momentum (captures the persistent uptrend)
+        ema_fast = self.ema(hist[-10:], 10) if len(hist) >= 3 else mid
+        ema_slow = self.ema(hist[-40:], 40) if len(hist) >= 10 else mid
+        if ema_fast is None:
+            ema_fast = mid
+        if ema_slow is None:
+            ema_slow = mid
+
+        momentum = ema_fast - ema_slow  # positive in uptrend
+        velocity = (mid - hist[-1]) if hist else 0.0
+
+        # Base fair value with trend and velocity
+        fair = mid + 0.60 * momentum + 0.20 * velocity
+
+        # Asymmetric inventory bias: aggressively long, never short
+        # Thresholds scaled to limit (80)
+        if position < 0:
+            fair += 10.0               # emergency buy-back when short
+        elif position < limit * 0.10:
+            fair += 5.0                # build fast from near-flat
+        elif position < limit * 0.40:
+            fair += 3.0                # continue accumulating
+        elif position < limit * 0.70:
+            fair += 1.5                # approaching limit, still nudge long
+        # above 70% of limit: momentum signal alone drives buys
+
+        # ── market-take: hit asks up to fair ─────────────────────────────────
+        pos = position
+        for ask in sorted(od.sell_orders.keys()):
+            vol = -od.sell_orders[ask]
+            if ask <= fair and pos < limit:
+                qty = min(vol, limit - pos, 20)
                 if qty > 0:
                     orders.append(Order(product, ask, qty))
                     pos += qty
             else:
                 break
 
-        for bid in sorted(order_depth.buy_orders.keys(), reverse=True):
-            bid_vol = order_depth.buy_orders[bid]
-            if bid >= fair + take_threshold and pos > -limit:
-                qty = min(bid_vol, pos + limit, max_clip)
+        # Sell ONLY into large spikes (≥10 above fair) and only from a long base
+        SPIKE_THRESHOLD = 10.0
+        MIN_LONG_FLOOR = limit // 4   # never go below 25% long on a spike
+        for bid in sorted(od.buy_orders.keys(), reverse=True):
+            vol = od.buy_orders[bid]
+            if bid >= fair + SPIKE_THRESHOLD and pos > MIN_LONG_FLOOR:
+                qty = min(vol, pos - MIN_LONG_FLOOR, 10)
                 if qty > 0:
                     orders.append(Order(product, bid, -qty))
                     pos -= qty
             else:
                 break
 
-        return orders, pos
+        # ── market-make: aggressive bid, very passive ask ─────────────────────
+        if bb is not None and ba is not None:
+            bid_q = min(bb + 1, math.floor(fair - 0.5))
+            ask_q = max(ba - 1, math.ceil(fair + SPIKE_THRESHOLD))
 
-    def market_make(
-        self,
-        product: str,
-        best_bid: Optional[int],
-        best_ask: Optional[int],
-        fair: float,
-        position: int,
-        limit: int,
-        base_size: int,
-    ) -> List[Order]:
-        orders: List[Order] = []
-        if best_bid is None or best_ask is None:
-            return orders
+            buy_cap = max(0, limit - pos)
+            # Only quote asks from surplus above 50% of limit
+            sell_cap = max(0, pos - limit // 2)
 
-        bid_quote = min(best_bid + 1, math.floor(fair - 1))
-        ask_quote = max(best_ask - 1, math.ceil(fair + 1))
+            buy_sz = min(20, buy_cap)
+            sell_sz = min(5, sell_cap)
 
-        if bid_quote >= ask_quote:
-            bid_quote = math.floor(fair - 1)
-            ask_quote = math.ceil(fair + 1)
+            if bid_q < ask_q:
+                if buy_sz > 0:
+                    orders.append(Order(product, bid_q, buy_sz))
+                if sell_sz > 0:
+                    orders.append(Order(product, ask_q, -sell_sz))
 
-        if bid_quote >= ask_quote:
-            return orders
+        return orders, mid
 
-        buy_capacity = max(0, limit - position)
-        sell_capacity = max(0, limit + position)
+    # ── ASH: tight mean-reversion / market-making around 10 000 ───────────────
+    #
+    # Data pattern:
+    #   - true fair value = 10000, perfectly stable across all days
+    #   - std dev ≈ 5.35, bid-ask spread ≈ 16
+    #
+    # Strategy:
+    #   1. Quote inside the spread symmetrically (capture ~14 per round trip)
+    #   2. Bollinger-band aggressive takes when price deviates > 1.5 std
+    #   3. Symmetric inventory penalty keeps position near 0
 
-        buy_size = min(base_size, buy_capacity)
-        sell_size = min(base_size, sell_capacity)
-
-        if position > 0.6 * limit:
-            buy_size = min(buy_size, 1)
-        if position < -0.6 * limit:
-            sell_size = min(sell_size, 1)
-
-        if buy_size > 0:
-            orders.append(Order(product, bid_quote, buy_size))
-        if sell_size > 0:
-            orders.append(Order(product, ask_quote, -sell_size))
-
-        return orders
-
-    # ---------- per-product strategies ----------
+    ASH_FAIR = 10_000.0
 
     def trade_ash(
         self,
         product: str,
-        order_depth: OrderDepth,
+        od: OrderDepth,
         position: int,
+        hist: list,
     ) -> List[Order]:
-        orders: List[Order] = []
         limit = self.POSITION_LIMIT[product]
+        orders: List[Order] = []
 
-        best_bid, best_bid_vol, best_ask, best_ask_vol = self.best_bid_ask(order_depth)
-        mid = self.mid_price(best_bid, best_ask)
+        bb, bv, ba, av = self.best_bid_ask(od)
+        mid = self.mid_price(bb, ba)
         if mid is None:
             return []
 
-        fair = self.fair_ash(mid, position)
-        take_orders, new_pos = self.market_take(
-            product=product,
-            order_depth=order_depth,
-            fair=fair,
-            position=position,
-            limit=limit,
-            take_threshold=1.5,
-            max_clip=5,
-        )
-        orders.extend(take_orders)
+        rolling_std = self.stddev(hist[-50:]) if len(hist) >= 20 else 5.35
+        if rolling_std < 1.5:
+            rolling_std = 5.35
 
-        mm_orders = self.market_make(
-            product=product,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            fair=fair,
-            position=new_pos,
-            limit=limit,
-            base_size=4,
-        )
-        orders.extend(mm_orders)
+        deviation = mid - self.ASH_FAIR
+        z = deviation / rolling_std
+
+        # Mean-reversion fair value (pulls toward 10000 proportionally)
+        fair = self.ASH_FAIR - 0.40 * deviation - 0.25 * position
+
+        # Bollinger: tighten take threshold when price is extreme
+        take_threshold = 1.5
+        if abs(z) > 1.5:
+            take_threshold = 0.5  # much more aggressive at extremes
+
+        # ── market-take ────────────────────────────────────────────────────────
+        pos = position
+        for ask in sorted(od.sell_orders.keys()):
+            vol = -od.sell_orders[ask]
+            if ask <= fair - take_threshold and pos < limit:
+                qty = min(vol, limit - pos, 20)
+                if qty > 0:
+                    orders.append(Order(product, ask, qty))
+                    pos += qty
+            else:
+                break
+
+        for bid in sorted(od.buy_orders.keys(), reverse=True):
+            vol = od.buy_orders[bid]
+            if bid >= fair + take_threshold and pos > -limit:
+                qty = min(vol, pos + limit, 20)
+                if qty > 0:
+                    orders.append(Order(product, bid, -qty))
+                    pos -= qty
+            else:
+                break
+
+        # ── market-make: symmetric inside spread ───────────────────────────────
+        if bb is not None and ba is not None:
+            bid_q = min(bb + 1, math.floor(fair - 1.0))
+            ask_q = max(ba - 1, math.ceil(fair + 1.0))
+
+            if bid_q >= ask_q:
+                bid_q = math.floor(fair) - 1
+                ask_q = math.ceil(fair) + 1
+
+            buy_cap = max(0, limit - pos)
+            sell_cap = max(0, limit + pos)
+
+            buy_sz = min(15, buy_cap)
+            sell_sz = min(15, sell_cap)
+
+            # Scale down the heavy side to avoid inventory drift
+            if pos > 0.5 * limit:
+                buy_sz = min(5, buy_cap)
+            if pos < -0.5 * limit:
+                sell_sz = min(5, sell_cap)
+
+            if pos >= limit:
+                buy_sz = 0
+            if pos <= -limit:
+                sell_sz = 0
+
+            if bid_q < ask_q:
+                if buy_sz > 0:
+                    orders.append(Order(product, bid_q, buy_sz))
+                if sell_sz > 0:
+                    orders.append(Order(product, ask_q, -sell_sz))
+
         return orders
 
-    def trade_pepper(
-        self,
-        product: str,
-        order_depth: OrderDepth,
-        position: int,
-        mid_hist: List[float],
-        prev_mid: Optional[float],
-    ) -> Tuple[List[Order], Optional[float]]:
-        orders: List[Order] = []
-        limit = self.POSITION_LIMIT[product]
-
-        best_bid, best_bid_vol, best_ask, best_ask_vol = self.best_bid_ask(order_depth)
-        mid = self.mid_price(best_bid, best_ask)
-        if mid is None:
-            return [], None
-
-        micro = self.microprice(best_bid, best_bid_vol, best_ask, best_ask_vol)
-        fair = self.fair_pepper(mid, micro, prev_mid, mid_hist, position)
-
-        take_orders, new_pos = self.market_take(
-            product=product,
-            order_depth=order_depth,
-            fair=fair,
-            position=position,
-            limit=limit,
-            take_threshold=2.5,
-            max_clip=5,
-        )
-        orders.extend(take_orders)
-
-        mm_orders = self.market_make(
-            product=product,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            fair=fair,
-            position=new_pos,
-            limit=limit,
-            base_size=5,
-        )
-        orders.extend(mm_orders)
-        return orders, mid
-
-    # ---------- main entry point ----------
+    # ── main entry point ───────────────────────────────────────────────────────
 
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
         conversions = 0
         memory = self.load_memory(state.traderData)
 
-        for product, order_depth in state.order_depths.items():
+        for product, od in state.order_depths.items():
             if product not in self.POSITION_LIMIT:
                 continue
 
-            position = state.position.get(product, 0)
+            pos = state.position.get(product, 0)
+            hist = memory["mid_hist"].setdefault(product, [])
 
-            if product == "ASH_COATED_OSMIUM":
-                result[product] = self.trade_ash(product, order_depth, position)
-            elif product == "INTARIAN_PEPPER_ROOT":
-                hist = memory["mid_hist"].setdefault(product, [])
-                prev_mid = memory["prev_mid"].get(product)
-                orders, new_mid = self.trade_pepper(
-                    product,
-                    order_depth,
-                    position,
-                    hist,
-                    prev_mid,
-                )
+            if product == "INTARIAN_PEPPER_ROOT":
+                orders, new_mid = self.trade_pepper(product, od, pos, hist)
                 result[product] = orders
                 if new_mid is not None:
                     hist.append(new_mid)
                     memory["mid_hist"][product] = hist[-self.MEMORY_LENGTH:]
-                    memory["prev_mid"][product] = new_mid
                 continue
 
-            best_bid, _, best_ask, _ = self.best_bid_ask(order_depth)
-            mid = self.mid_price(best_bid, best_ask)
-            if mid is not None:
-                memory["mid_hist"].setdefault(product, []).append(mid)
-                memory["mid_hist"][product] = memory["mid_hist"][product][-self.MEMORY_LENGTH:]
-                memory["prev_mid"][product] = mid
+            if product == "ASH_COATED_OSMIUM":
+                result[product] = self.trade_ash(product, od, pos, hist)
 
-        trader_data = self.save_memory(memory)
-        return result, conversions, trader_data
+            bb, _, ba, _ = self.best_bid_ask(od)
+            m = self.mid_price(bb, ba)
+            if m is not None:
+                hist.append(m)
+                memory["mid_hist"][product] = hist[-self.MEMORY_LENGTH:]
+
+        return result, conversions, self.save_memory(memory)

@@ -1,7 +1,123 @@
+"""Round 3 Prosperity submission.
+
+This file is uploaded verbatim to the IMC Prosperity platform. Hard rules:
+
+* Imports limited to stdlib + the platform-provided ``datamodel``.
+* No imports from ``prosperity_lib`` (it isn't shipped to the sandbox).
+* The Black-Scholes block is mirrored verbatim from
+  ``prosperity_lib/options/blackscholes.py`` between the
+  ``BS_INLINE_BEGIN`` / ``BS_INLINE_END`` markers; ``tests/test_inline_parity.py``
+  enforces the mirror.
+
+Strategy stubs (``trade_hydrogel``, ``trade_velvet``, ``trade_vev``) currently
+return no orders — alpha is developed in research notebooks and ported in
+once it survives a backtest.
+"""
+
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List, Optional, Tuple
 import json
 import math
+
+
+# ===========================================================================
+# Black-Scholes block
+# ===========================================================================
+# BS_INLINE_BEGIN
+import math
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _d1_d2(S: float, K: float, T: float, sigma: float, r: float):
+    sqrt_t = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    return d1, d2
+
+
+def bs_price(S: float, K: float, T: float, sigma: float,
+             r: float = 0.0, call: bool = True) -> float:
+    if T <= 0.0 or sigma <= 0.0:
+        intrinsic = max(S - K, 0.0) if call else max(K - S, 0.0)
+        return intrinsic * math.exp(-r * max(T, 0.0))
+    d1, d2 = _d1_d2(S, K, T, sigma, r)
+    disc = math.exp(-r * T)
+    if call:
+        return S * _norm_cdf(d1) - K * disc * _norm_cdf(d2)
+    return K * disc * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def delta(S: float, K: float, T: float, sigma: float,
+          r: float = 0.0, call: bool = True) -> float:
+    if T <= 0.0 or sigma <= 0.0:
+        if call:
+            return 1.0 if S > K else (0.5 if S == K else 0.0)
+        return -1.0 if S < K else (-0.5 if S == K else 0.0)
+    d1, _ = _d1_d2(S, K, T, sigma, r)
+    return _norm_cdf(d1) if call else _norm_cdf(d1) - 1.0
+
+
+def gamma(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
+    if T <= 0.0 or sigma <= 0.0 or S <= 0.0:
+        return 0.0
+    d1, _ = _d1_d2(S, K, T, sigma, r)
+    return _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+
+
+def vega(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
+    if T <= 0.0 or sigma <= 0.0:
+        return 0.0
+    d1, _ = _d1_d2(S, K, T, sigma, r)
+    return S * _norm_pdf(d1) * math.sqrt(T)
+
+
+def theta(S: float, K: float, T: float, sigma: float,
+          r: float = 0.0, call: bool = True) -> float:
+    if T <= 0.0 or sigma <= 0.0:
+        return 0.0
+    d1, d2 = _d1_d2(S, K, T, sigma, r)
+    disc = math.exp(-r * T)
+    first = -(S * _norm_pdf(d1) * sigma) / (2.0 * math.sqrt(T))
+    if call:
+        return first - r * K * disc * _norm_cdf(d2)
+    return first + r * K * disc * _norm_cdf(-d2)
+# BS_INLINE_END
+
+
+# ===========================================================================
+# Round 3 product configuration
+# ===========================================================================
+
+VEV_STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+VEV_UNDERLYING = "VELVETFRUIT_EXTRACT"
+VEV_PRODUCTS = [f"VEV_{k}" for k in VEV_STRIKES]
+VEV_STRIKE_OF = {f"VEV_{k}": k for k in VEV_STRIKES}
+
+# Days are encoded as ``state.timestamp // TS_PER_DAY``; in-day ts spans 0..999_900.
+TS_PER_DAY = 1_000_000
+TTE_ANCHOR_DAY = 1
+TTE_TOTAL_DAYS = 7
+
+
+def _tte(global_timestamp: int) -> float:
+    """Time-to-expiry in days from ``state.timestamp``. Mirror of
+    ``prosperity_lib.options.tte.tte_days``."""
+    day = global_timestamp // TS_PER_DAY
+    ts = global_timestamp % TS_PER_DAY
+    elapsed = (day - TTE_ANCHOR_DAY) + (ts / TS_PER_DAY)
+    return max(TTE_TOTAL_DAYS - elapsed, 0.0)
+
+
+# ===========================================================================
+# Trader
+# ===========================================================================
 
 
 class Trader:

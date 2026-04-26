@@ -42,11 +42,12 @@ class Trader:
     COUNTERPARTY_DECAY = 0.82
     COUNTERPARTY_SIGNAL_CAP = 8.0
     DECAY_SHORT_TARGET = {
-        "VEV_5100": -60,
-        "VEV_5200": -70,
-        "VEV_5300": -70,
-        "VEV_5400": -90,
-        "VEV_5500": -90,
+        "VEV_5000": -300,
+        "VEV_5100": -300,
+        "VEV_5200": -300,
+        "VEV_5300": -300,
+        "VEV_5400": -300,
+        "VEV_5500": -300,
     }
 
     def load_memory(self, trader_data: str) -> dict:
@@ -435,11 +436,24 @@ class Trader:
         theoretical = self.bs_call_value(spot_fair, strike, ttm, sigma)
         delta = self.bs_delta(spot_fair, strike, ttm, sigma)
         distance = abs(strike - spot_fair)
-        if distance > self.ACTIVE_OPTION_DISTANCE:
-            return [], option_mid, delta
 
         best_bid, _, best_ask, _ = self.best_bid_ask(od)
         spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else 2
+        orders: List[Order] = []
+        pos = position
+
+        if product in self.DECAY_SHORT_TARGET and round_progress < 0.92 and best_bid is not None and best_bid > 0:
+            short_target = self.DECAY_SHORT_TARGET[product]
+            if pos > short_target:
+                available = od.buy_orders.get(best_bid, 0)
+                qty = min(available, pos - short_target, 15)
+                if qty > 0:
+                    orders.append(Order(product, best_bid, -qty))
+                    pos -= qty
+
+        if distance > self.ACTIVE_OPTION_DISTANCE:
+            return orders, option_mid, delta
+
         model_cap = option_mid + max(2.0, 0.75 * spread + max(0.0, fair_shift))
         model_floor = option_mid - max(2.0, 0.75 * spread + max(0.0, -fair_shift))
         theoretical = min(model_cap, max(model_floor, theoretical))
@@ -457,17 +471,6 @@ class Trader:
 
         edge = max(1.0, 0.55 * spread)
         quote_edge = max(1.0, edge + 0.35)
-        orders: List[Order] = []
-        pos = position
-
-        if product in self.DECAY_SHORT_TARGET and round_progress < 0.92 and best_bid is not None and best_bid > 0:
-            short_target = self.DECAY_SHORT_TARGET[product]
-            if pos > short_target:
-                available = od.buy_orders.get(best_bid, 0)
-                qty = min(available, pos - short_target, 8)
-                if qty > 0:
-                    orders.append(Order(product, best_bid, -qty))
-                    pos -= qty
 
         buy_room = max(0, limit - pos)
         sell_room = max(0, limit + pos)

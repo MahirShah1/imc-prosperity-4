@@ -14,7 +14,7 @@ import pytest
 import options
 import trader
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 MARKER_RE = re.compile(
     r"# BS_INLINE_BEGIN\n(.*?)\n# BS_INLINE_END",
     re.DOTALL,

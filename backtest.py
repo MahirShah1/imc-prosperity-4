@@ -23,14 +23,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-from datamodel import Order, OrderDepth, TradingState
-from Observation import Observation
+from datamodel import Observation, Order, OrderDepth, TradingState
 
 
 # ---------- round 3 config ----------
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "Data"
+DATA_DIR = ROOT / "data"
 
 DEFAULT_POSITION_LIMIT = 20
 TS_PER_DAY = 1_000_000
